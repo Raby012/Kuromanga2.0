@@ -856,18 +856,23 @@ const ReaderPage = ({ manga, chapter, chapters, onBack, onChapterChange }) => {
   const topRef = useRef();
 
   useEffect(() => {
-    if (!chapter?.id) return;
-    setLoading(true); setError(null); setPages([]); setCurPage(0); setFailedPages({});
-    API.chapterPages(chapter.id)
-      .then(data => {
-        if (!data?.chapter) throw new Error("No data");
-        const { baseUrl, chapter: { hash, data: hi, dataSaver: lo } } = data;
-        setPages(hi.map((p, i) => ({ hq: `${baseUrl}/data/${hash}/${p}`, lq: lo?.[i] ? `${baseUrl}/data-saver/${hash}/${lo[i]}` : null })));
-        topRef.current?.scrollIntoView?.();
-      })
-      .catch(e => setError(e.message))
-      .finally(() => setLoading(false));
-  }, [chapter?.id]);
+  if (!chapter?.id) return;
+  setLoading(true); setError(null); setPages([]); setCurPage(0); setFailedPages({});
+  if (chapter.attributes?.externalUrl) {
+    setLoading(false);
+    setError("external");
+    return;
+  }
+  API.chapterPages(chapter.id)
+    .then(data => {
+      if (!data?.chapter) throw new Error("No data");
+      const { baseUrl, chapter: { hash, data: hi, dataSaver: lo } } = data;
+      setPages(hi.map((p, i) => ({ hq: `${baseUrl}/data/${hash}/${p}`, lq: lo?.[i] ? `${baseUrl}/data-saver/${hash}/${lo[i]}` : null })));
+      topRef.current?.scrollIntoView?.();
+    })
+    .catch(e => setError(e.message))
+    .finally(() => setLoading(false));
+}, [chapter?.id]);
 
   const idx = chapters.findIndex(c => c.id === chapter.id);
   const hasPrev = idx < chapters.length - 1;
