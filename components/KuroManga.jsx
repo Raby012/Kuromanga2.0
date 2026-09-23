@@ -110,14 +110,25 @@ const API = {
     "includes[]": ["cover_art", "author", "artist", "scanlation_group"],
   }),
 
-  chapters: (mangaId) => mdxFetch(`/manga/${mangaId}/feed`, {
-    limit: 500,
-    offset: 0,
-    "translatedLanguage[]": ["en"],
-    "order[chapter]": "desc",
-    "includes[]": ["scanlation_group"],
-    "contentRating[]": ["safe", "suggestive"],
-  }),
+  chapters: async (mangaId) => {
+  const limit = 500;
+  let offset = 0, all = [], total = Infinity;
+  while (offset < total) {
+    const res = await mdxFetch(`/manga/${mangaId}/feed`, {
+      limit,
+      offset,
+      "translatedLanguage[]": ["en"],
+      "order[chapter]": "desc",
+      "includes[]": ["scanlation_group"],
+      "contentRating[]": ["safe", "suggestive"],
+    });
+    if (!res?.data?.length) break;
+    all = all.concat(res.data);
+    total = res.total ?? all.length;
+    offset += limit;
+  }
+  return { data: all };
+},
 
   autocomplete: (q) => mdxFetch("/manga", { ...DEF, limit: 6, title: q }),
 
@@ -731,18 +742,23 @@ const InfoPage = ({ mangaId, onBack, onRead }) => {
       .catch(console.error)
       .finally(() => setLoading(false));
     API.chapters(mangaId)
-      .then(res => {
-        const seen = new Set();
-        const deduped = (res?.data || []).filter(c => {
-          const n = c.attributes?.chapter;
-          if (!n || seen.has(n)) return false;
-          seen.add(n); return true;
-        });
-        deduped.sort((a, b) => parseFloat(b.attributes?.chapter||0) - parseFloat(a.attributes?.chapter||0));
-        setChapters(deduped);
-      })
-      .catch(console.error)
-      .finally(() => setChapLoading(false));
+  .then(res => {
+    const seen = new Map();
+    (res?.data || []).forEach(c => {
+      const n = c.attributes?.chapter;
+      if (!n) return;
+      const isExternal = !!c.attributes?.externalUrl; // MangaDex par pages nahi hain
+      const existing = seen.get(n);
+      if (!existing || (!isExternal && existing.attributes?.externalUrl)) {
+        seen.set(n, c); // readable version ko priority do, external ko replace kar do
+      }
+    });
+    const deduped = Array.from(seen.values());
+    deduped.sort((a, b) => parseFloat(b.attributes?.chapter||0) - parseFloat(a.attributes?.chapter||0));
+    setChapters(deduped);
+  })
+  .catch(console.error)
+  .finally(() => setChapLoading(false));
   }, [mangaId]);
 
   const filtered = chapters.filter(c => {
