@@ -37,6 +37,26 @@ const proxyCover = (mangaId, fileName, size = 256) => {
 const chapterPagesFetch = (chapterId) =>
   fetch(`https://api.mangadex.org/at-home/server/${chapterId}`).then(r => r.json());
 
+// ComicK fetch - hamare /api/comick proxy ke through (rate-limit safe, mirrors handled server-side)
+const comickFetch = async (params) => {
+  const parts = Object.entries(params)
+    .filter(([, v]) => v !== null && v !== undefined && v !== "")
+    .map(([k, v]) => `${k}=${encodeURIComponent(v)}`);
+  const r = await fetch(`/api/comick?${parts.join("&")}`);
+  if (!r.ok) throw new Error("ComicK API " + r.status);
+  return r.json();
+};
+
+// Title ko normalize karo taaki dono sources (MangaDex + ComicK) ke titles compare ho sakein.
+// NOTE: ye sirf exact-normalized-match hai (case/punctuation/accents ignore karke) -
+// pura alag-script wala alt-title (jaise Korean vs English) match nahi karega.
+// Isliye dedup sirf tabhi kaam karega jab dono sources same (usually English) title de rahe hon.
+const normTitle = (t) => (t || "")
+  .toLowerCase()
+  .normalize("NFKD").replace(/[\u0300-\u036f]/g, "")
+  .replace(/[^a-z0-9]+/g, " ")
+  .trim();
+
 // ============================================================
 // NORMALIZERS
 // ============================================================
@@ -71,7 +91,41 @@ const normalizeForCard = (m) => ({
   description: (() => { const d = m.attributes?.description || {}; return d.en || Object.values(d)[0] || ""; })(),
   tags: (m.attributes?.tags || []).map(t => (t.attributes?.name || {}).en || "").filter(Boolean),
   altTitles: (m.attributes?.altTitles || []).flatMap(o => Object.values(o)).filter(Boolean),
+  source: "mangadex",
 });
+
+// ComicK search result -> same card shape jo MangaDex use karta hai.
+// Search response me "country" nahi aata (sirf details page pe), isliye type yahan
+// "unknown" rakha hai - InfoPage khulne par asli type details se update ho jaata hai.
+const normalizeComickForCard = (c) => ({
+  id: `comick:${c.slug}`,
+  slug: c.slug,
+  source: "comick",
+  title: c.title || "Unknown",
+  cover: c.default_thumbnail || c.thumbnail || "",
+  cover512: c.default_thumbnail || c.thumbnail || "",
+  type: "unknown",
+  status: "ongoing",
+  rating: null,
+  lastChapter: null,
+  year: null,
+  description: "",
+  tags: [],
+  altTitles: [],
+});
+
+// Do lists (MangaDex + ComicK) ko title ke basis par merge karo, duplicates hata ke.
+// MangaDex ko priority di gayi hai (zyada reliable/complete metadata) - agar same
+// normalized title dono me mile toh MangaDex wala hi rakha jaata hai.
+const mergeCatalogs = (mdxList, comickList) => {
+  const seen = new Map();
+  mdxList.forEach(m => seen.set(normTitle(m.title), m));
+  comickList.forEach(c => {
+    const key = normTitle(c.title);
+    if (key && !seen.has(key)) seen.set(key, c);
+  });
+  return Array.from(seen.values());
+};
 
 // ============================================================
 // API CALLS — use our proxy at /api/manga
@@ -110,29 +164,22 @@ const API = {
     "includes[]": ["cover_art", "author", "artist", "scanlation_group"],
   }),
 
-  chapters: async (mangaId) => {
-  const limit = 500;
-  let offset = 0, all = [], total = Infinity;
-  while (offset < total) {
-    const res = await mdxFetch(`/manga/${mangaId}/feed`, {
-      limit,
-      offset,
-      "translatedLanguage[]": ["en"],
-      "order[chapter]": "desc",
-      "includes[]": ["scanlation_group"],
-      "contentRating[]": ["safe", "suggestive"],
-    });
-    if (!res?.data?.length) break;
-    all = all.concat(res.data);
-    total = res.total ?? all.length;
-    offset += limit;
-  }
-  return { data: all };
-},
+  chapters: (mangaId) => mdxFetch(`/manga/${mangaId}/feed`, {
+    limit: 500,
+    offset: 0,
+    "translatedLanguage[]": ["en"],
+    "order[chapter]": "desc",
+    "includes[]": ["scanlation_group"],
+    "contentRating[]": ["safe", "suggestive"],
+  }),
 
   autocomplete: (q) => mdxFetch("/manga", { ...DEF, limit: 6, title: q }),
 
   chapterPages: chapterPagesFetch,
+  comickSearch: (title) => comickFetch({ action: "search", q: title }),
+  comickChapters: (slug) => comickFetch({ action: "chapters", slug, lang: "en" }),
+  comickDetails: (slug) => comickFetch({ action: "details", slug }),
+  comickPages: (chapterUrl) => comickFetch({ action: "pages", chapterUrl }),
 };
 
 // ============================================================
@@ -626,11 +673,28 @@ const BrowsePage = ({ initialQ = "", onMangaClick }) => {
     setError(null);
     window.scrollTo(0, 0);
     try {
-      const res = q?.trim()
-        ? await API.search(q, pg, t, s)
-        : await API.browse(pg, t, s, o);
-      setResults((res.data || []).map(normalizeForCard));
-      setTotal(res.total || 0);
+      if (q?.trim()) {
+        // Search: MangaDex + ComicK dono se, title ke basis par dedup karke
+        const res = await API.search(q, pg, t, s);
+        const mdxResults = (res.data || []).map(normalizeForCard);
+
+        let comickResults = [];
+        try {
+          const cRes = await API.comickSearch(q);
+          comickResults = (cRes?.data || []).map(normalizeComickForCard);
+        } catch (e) {
+          console.error("ComicK search failed (MangaDex results still shown):", e);
+        }
+
+        setResults(mergeCatalogs(mdxResults, comickResults));
+        setTotal(res.total || mdxResults.length);
+      } else {
+        // Plain browse (no search query): sirf MangaDex, kyunki ComicK ka
+        // koi general "browse by filter" endpoint hamare paas nahi hai abhi.
+        const res = await API.browse(pg, t, s, o);
+        setResults((res.data || []).map(normalizeForCard));
+        setTotal(res.total || 0);
+      }
     } catch (e) {
       console.error("browse:", e);
       setError("Failed to load. Please try again.");
@@ -735,30 +799,111 @@ const InfoPage = ({ mangaId, onBack, onRead }) => {
   const [chapSearch, setChapSearch] = useState("");
   const [chapOrder, setChapOrder] = useState("desc");
 
+  const isComickNative = typeof mangaId === "string" && mangaId.startsWith("comick:");
+  const comickSlug = isComickNative ? mangaId.slice("comick:".length) : null;
+
   useEffect(() => {
     setLoading(true); setChapLoading(true); setChapters([]); setInfo(null);
+
+    if (isComickNative) {
+      // --- Manga khud ComicK se click hua tha (MangaDex par nahi mila) ---
+      API.comickDetails(comickSlug)
+        .then(data => {
+          const country = data?.country;
+          const type = country === "jp" ? "manga" : country === "cn" ? "manhua" : "manhwa";
+          setInfo({
+            id: mangaId, source: "comick", slug: comickSlug,
+            title: data?.title || "Unknown", cover: data?.thumbnail || "", cover512: data?.thumbnail || "",
+            type, status: data?.status === 2 ? "completed" : data?.status === 4 ? "hiatus" : "ongoing",
+            rating: null, lastChapter: null, year: null,
+            description: data?.desc || "",
+            tags: (data?.genres || []).map(g => g.genres?.name).filter(Boolean),
+            altTitles: (data?.titles || []).map(t => t.title).filter(Boolean),
+          });
+        })
+        .catch(console.error)
+        .finally(() => setLoading(false));
+
+      API.comickChapters(comickSlug)
+        .then(res => {
+          const seen = new Map();
+          (res?.data || []).forEach(cc => {
+            const n = cc.chap;
+            if (!n) return;
+            if (!seen.has(n)) {
+              seen.set(n, {
+                id: cc.hid, source: "comick", slug: comickSlug,
+                attributes: { chapter: n, title: cc.title || "", pages: null },
+              });
+            }
+          });
+          const deduped = Array.from(seen.values());
+          deduped.sort((a, b) => parseFloat(b.attributes?.chapter||0) - parseFloat(a.attributes?.chapter||0));
+          setChapters(deduped);
+        })
+        .catch(console.error)
+        .finally(() => setChapLoading(false));
+      return;
+    }
+
+    // --- Manga MangaDex se click hua tha ---
     API.manga(mangaId)
       .then(res => { if (res?.data) setInfo(normalizeForCard(res.data)); })
       .catch(console.error)
       .finally(() => setLoading(false));
+
     API.chapters(mangaId)
-  .then(res => {
-    const seen = new Map();
-    (res?.data || []).forEach(c => {
-      const n = c.attributes?.chapter;
-      if (!n) return;
-      const isExternal = !!c.attributes?.externalUrl; // MangaDex par pages nahi hain
-      const existing = seen.get(n);
-      if (!existing || (!isExternal && existing.attributes?.externalUrl)) {
-        seen.set(n, c); // readable version ko priority do, external ko replace kar do
-      }
-    });
-    const deduped = Array.from(seen.values());
-    deduped.sort((a, b) => parseFloat(b.attributes?.chapter||0) - parseFloat(a.attributes?.chapter||0));
-    setChapters(deduped);
-  })
-  .catch(console.error)
-  .finally(() => setChapLoading(false));
+      .then(async res => {
+        const seen = new Map();
+        (res?.data || []).forEach(c => {
+          const n = c.attributes?.chapter;
+          if (!n) return;
+          const isExternal = !!c.attributes?.externalUrl;
+          const existing = seen.get(n);
+          if (!existing || (!isExternal && existing.attributes?.externalUrl)) {
+            seen.set(n, { ...c, source: "mangadex" });
+          }
+        });
+
+        // Jo chapters MangaDex par sirf external hain (licensed series), unke liye
+        // ComicK try karo - title match karke, taaki wahi chapter dusre manga ka na aa jaye.
+        const stillExternal = Array.from(seen.values()).filter(c => c.attributes?.externalUrl);
+        if (stillExternal.length > 0) {
+          try {
+            const mangaRes = await API.manga(mangaId);
+            const titleMap = mangaRes?.data?.attributes?.title || {};
+            const title = titleMap.en || Object.values(titleMap)[0];
+            if (title) {
+              const searchRes = await API.comickSearch(title);
+              // Exact normalized-title match dhoondo - taaki similar-naam wale
+              // kisi doosre manga/manhwa ka chapter galti se mix na ho.
+              const match = (searchRes?.data || []).find(r => normTitle(r.title) === normTitle(title));
+              if (match?.slug) {
+                const comickRes = await API.comickChapters(match.slug);
+                (comickRes?.data || []).forEach(cc => {
+                  const n = cc.chap;
+                  if (!n) return;
+                  const existing = seen.get(n);
+                  if (existing?.attributes?.externalUrl) {
+                    seen.set(n, {
+                      id: cc.hid, source: "comick", slug: match.slug,
+                      attributes: { chapter: n, title: cc.title || "", pages: null },
+                    });
+                  }
+                });
+              }
+            }
+          } catch (e) {
+            console.error("ComicK fallback failed (external-link chapters will show as-is):", e);
+          }
+        }
+
+        const deduped = Array.from(seen.values());
+        deduped.sort((a, b) => parseFloat(b.attributes?.chapter||0) - parseFloat(a.attributes?.chapter||0));
+        setChapters(deduped);
+      })
+      .catch(console.error)
+      .finally(() => setChapLoading(false));
   }, [mangaId]);
 
   const filtered = chapters.filter(c => {
@@ -856,23 +1001,38 @@ const ReaderPage = ({ manga, chapter, chapters, onBack, onChapterChange }) => {
   const topRef = useRef();
 
   useEffect(() => {
-  if (!chapter?.id) return;
-  setLoading(true); setError(null); setPages([]); setCurPage(0); setFailedPages({});
-  if (chapter.attributes?.externalUrl) {
-    setLoading(false);
-    setError("external");
-    return;
-  }
-  API.chapterPages(chapter.id)
-    .then(data => {
-      if (!data?.chapter) throw new Error("No data");
-      const { baseUrl, chapter: { hash, data: hi, dataSaver: lo } } = data;
-      setPages(hi.map((p, i) => ({ hq: `${baseUrl}/data/${hash}/${p}`, lq: lo?.[i] ? `${baseUrl}/data-saver/${hash}/${lo[i]}` : null })));
-      topRef.current?.scrollIntoView?.();
-    })
-    .catch(e => setError(e.message))
-    .finally(() => setLoading(false));
-}, [chapter?.id]);
+    if (!chapter?.id) return;
+    setLoading(true); setError(null); setPages([]); setCurPage(0); setFailedPages({});
+
+    if (chapter.source === "comick") {
+      const chapterUrl = `/comic/${chapter.slug}/${chapter.id}-chapter-${chapter.attributes.chapter}-en`;
+      API.comickPages(chapterUrl)
+        .then(data => {
+          if (!data?.images?.length) throw new Error("No pages");
+          setPages(data.images.map(url => ({ hq: url, lq: null })));
+          topRef.current?.scrollIntoView?.();
+        })
+        .catch(e => setError(e.message))
+        .finally(() => setLoading(false));
+      return;
+    }
+
+    if (chapter.attributes?.externalUrl) {
+      // MangaDex par bhi nahi hai aur ComicK me match/chapter nahi mila
+      setLoading(false); setError("external");
+      return;
+    }
+
+    API.chapterPages(chapter.id)
+      .then(data => {
+        if (!data?.chapter) throw new Error("No data");
+        const { baseUrl, chapter: { hash, data: hi, dataSaver: lo } } = data;
+        setPages(hi.map((p, i) => ({ hq: `${baseUrl}/data/${hash}/${p}`, lq: lo?.[i] ? `${baseUrl}/data-saver/${hash}/${lo[i]}` : null })));
+        topRef.current?.scrollIntoView?.();
+      })
+      .catch(e => setError(e.message))
+      .finally(() => setLoading(false));
+  }, [chapter?.id]);
 
   const idx = chapters.findIndex(c => c.id === chapter.id);
   const hasPrev = idx < chapters.length - 1;
@@ -904,7 +1064,8 @@ const ReaderPage = ({ manga, chapter, chapters, onBack, onChapterChange }) => {
       </div>
 
       {loading ? <div className="reader-loading"><div className="lring" style={{width:48,height:48}}/><div className="ltxt">Loading Chapter {chapter?.attributes?.chapter||""}...</div></div>
-      : error ? <div className="reader-err"><div style={{fontSize:52}}>😔</div><h3>Could not load pages</h3><p>This chapter may be unavailable from MangaDex. Try another chapter.</p><div style={{display:"flex",gap:10,marginTop:8}}><button className="rbtn" disabled={!hasPrev} onClick={prevChap}>‹ Previous</button><button className="rbtn" disabled={!hasNext} onClick={nextChap}>Next ›</button></div></div>
+      : error === "external" ? <div className="reader-err"><div style={{fontSize:52}}>🔗</div><h3>Ye chapter sirf official site pe hai</h3><p>Na MangaDex, na ComicK par hosted mila.</p><a className="rbtn" href={chapter.attributes.externalUrl} target="_blank" rel="noreferrer" style={{display:"inline-block",marginTop:8}}>Wahan padho ↗</a></div>
+      : error ? <div className="reader-err"><div style={{fontSize:52}}>😔</div><h3>Could not load pages</h3><p>This chapter may be unavailable. Try another chapter.</p><div style={{display:"flex",gap:10,marginTop:8}}><button className="rbtn" disabled={!hasPrev} onClick={prevChap}>‹ Previous</button><button className="rbtn" disabled={!hasNext} onClick={nextChap}>Next ›</button></div></div>
       : mode==="scroll" ? (
         <div className="scroll-imgs">
           {pages.map((pg,i)=>failedPages[i]?<div key={i} className="page-err">Page {i+1} unavailable</div>:<img key={i} className="scroll-img" src={pg.hq} alt={`Page ${i+1}`} loading={i<3?"eager":"lazy"} onError={e=>handleErr(i,e)}/>)}
